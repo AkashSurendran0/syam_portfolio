@@ -190,8 +190,12 @@ const upload = multer({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Normalize URL in case serverless rewrite stripped /api
+// Normalize URL in case serverless rewrite alters req.url
 app.use((req, res, next) => {
+  const originalUrl = req.headers['x-matched-path'] || req.headers['x-vercel-matched-path'];
+  if (originalUrl) {
+    req.url = originalUrl;
+  }
   if (!req.url.startsWith('/api') && (
     req.url.startsWith('/categories') ||
     req.url.startsWith('/projects') ||
@@ -219,19 +223,24 @@ function requireAuth(req, res, next) {
 // AUTH ROUTES
 // ===================================================================
 
-// Login: Compare SHA-256 hash of secretKeyword (client sends hash, never plaintext)
-app.post('/api/auth/login', (req, res) => {
-  const { keyHash } = req.body;
-  if (!keyHash || typeof keyHash !== 'string') {
-    return res.status(400).json({ success: false, message: 'Secret keyword is required.' });
-  }
-
-  // Hash the server-side secret for constant-time comparison
+// Login: Compare SHA-256 hash or plaintext secretKeyword
+app.post(['/api/auth/login', '/auth/login'], (req, res) => {
+  const { keyHash, secretKeyword } = req.body || {};
   const expectedHash = crypto.createHash('sha256').update(SECRET_KEYWORD).digest('hex');
-  const isValid = crypto.timingSafeEqual(
-    Buffer.from(keyHash.toLowerCase(), 'hex'),
-    Buffer.from(expectedHash, 'hex')
-  );
+
+  let isValid = false;
+  if (keyHash && typeof keyHash === 'string') {
+    try {
+      isValid = crypto.timingSafeEqual(
+        Buffer.from(keyHash.toLowerCase(), 'hex'),
+        Buffer.from(expectedHash, 'hex')
+      );
+    } catch (e) {
+      isValid = false;
+    }
+  } else if (secretKeyword && typeof secretKeyword === 'string') {
+    isValid = secretKeyword.trim() === SECRET_KEYWORD;
+  }
 
   if (isValid) {
     const token = crypto.randomBytes(32).toString('hex');
@@ -243,7 +252,7 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // Verify Session
-app.get('/api/auth/verify', (req, res) => {
+app.get(['/api/auth/verify', '/auth/verify'], (req, res) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
@@ -255,7 +264,7 @@ app.get('/api/auth/verify', (req, res) => {
 });
 
 // Logout
-app.post('/api/auth/logout', (req, res) => {
+app.post(['/api/auth/logout', '/auth/logout'], (req, res) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
@@ -612,29 +621,36 @@ app.delete('/api/projects/:id/images/:angleIndex', requireAuth, (req, res) => {
 });
 
 // ===================================================================
-// HTML ROUTING & STATIC ASSETS (local dev only — Vercel CDN handles static)
+// HTML ROUTING & STATIC ASSETS
 // ===================================================================
 
-if (!process.env.VERCEL) {
-  // Route for /adminPortal (local dev)
-  app.get(['/adminPortal', '/adminPortal.html', '/adminportal'], (req, res) => {
-    res.sendFile(path.join(__dirname, 'adminPortal.html'));
-  });
+// Route for /adminPortal
+app.get(['/adminPortal', '/adminPortal.html', '/adminportal'], (req, res) => {
+  const adminFile = fs.existsSync(path.join(__dirname, 'public', 'adminPortal.html'))
+    ? path.join(__dirname, 'public', 'adminPortal.html')
+    : path.join(__dirname, 'adminPortal.html');
+  res.sendFile(adminFile);
+});
 
-  // Static assets (local dev)
-  app.use(express.static(__dirname));
-
-  // Fallback to index.html for SPA/client routing (local dev)
-  app.use((req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
-  });
-} else {
-  // On Vercel: only handle API routes; static files served by Vercel CDN.
-  // Return 404 for any non-API route that slips through.
-  app.use((req, res) => {
-    res.status(404).json({ error: 'Not found', note: 'Static assets are served by Vercel CDN.' });
-  });
+// Static assets (serves from public/ first, then root as fallback)
+if (fs.existsSync(path.join(__dirname, 'public'))) {
+  app.use(express.static(path.join(__dirname, 'public')));
 }
+app.use(express.static(__dirname));
+
+// Fallback to index.html for SPA/client routing (or 404 for unhandled API calls)
+app.use((req, res) => {
+  if (req.url.startsWith('/api')) {
+    return res.status(404).json({ success: false, message: `API endpoint ${req.url} not found` });
+  }
+  const indexFile = fs.existsSync(path.join(__dirname, 'public', 'index.html'))
+    ? path.join(__dirname, 'public', 'index.html')
+    : path.join(__dirname, 'index.html');
+  if (fs.existsSync(indexFile)) {
+    return res.sendFile(indexFile);
+  }
+  res.status(404).send('Page not found');
+});
 
 // Start Server when run directly (local development)
 if (require.main === module || !process.env.VERCEL) {
