@@ -55,4 +55,8 @@ filesToCopy.forEach(file => {
   }
 });
 
-console.log('Build complete: Successfully populated public/ with all static assets.');
+// 3. Provide Node entrypoints in public/ in case Vercel Node.js framework builder scans for them
+fs.writeFileSync(path.join(publicDir, 'index.js'), "module.exports = require('../server.js');\n");
+fs.writeFileSync(path.join(publicDir, 'server.js'), "module.exports = require('../server.js');\n");
+
+console.log('Build complete: Successfully populated public/ with all static assets and entrypoints.');
