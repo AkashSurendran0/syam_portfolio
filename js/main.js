@@ -241,12 +241,24 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/projects');
       if (!res.ok) return;
       const data = await res.json();
-      if (!data.success || !Array.isArray(data.projects) || data.projects.length === 0) return;
+      if (!data.success || !Array.isArray(data.projects)) return;
 
       const grid = document.querySelector('.projects-grid');
       if (!grid) return;
 
+      // Always clear grid when API responds successfully
       grid.innerHTML = '';
+
+      if (data.projects.length === 0) {
+        grid.innerHTML = `
+          <div style="grid-column: 1 / -1; padding: 60px 20px; text-align: center; color: var(--color-text-muted);">
+            <p style="font-size: 1.1rem; margin-bottom: 8px;">No projects published yet.</p>
+            <p style="font-size: 0.85rem; opacity: 0.7;">Create projects in the <a href="/adminPortal" style="color: inherit; text-decoration: underline;">Admin Portal</a>.</p>
+          </div>
+        `;
+        return;
+      }
+
       data.projects.forEach(project => {
         const firstAngle = (project.angles && project.angles.length > 0) ? project.angles[0].src : '';
         const count = project.angles ? project.angles.length : 1;
@@ -278,7 +290,7 @@ document.addEventListener('DOMContentLoaded', () => {
       bindProjectCards();
       applyProjectFilter(currentActiveFilter);
     } catch (err) {
-      console.log('Using static project cards fallback:', err.message);
+      console.log('Error loading dynamic projects:', err.message);
     }
   }
 

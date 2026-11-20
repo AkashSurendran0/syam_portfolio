@@ -402,7 +402,7 @@ app.get('/api/projects/:id', (req, res) => {
 });
 
 // POST /api/projects - Create Project (Protected)
-app.post('/api/projects', requireAuth, upload.array('images', 20), async (req, res) => {
+app.post(['/api/projects', '/projects'], requireAuth, upload.array('images', 20), async (req, res) => {
   try {
     const { title, category, folderName, customLabels } = req.body;
     if (!title) {
@@ -412,9 +412,7 @@ app.post('/api/projects', requireAuth, upload.array('images', 20), async (req, r
     const projects = readProjects();
     const folderSlug = slugify(folderName || title);
     const projectId = folderSlug + '-' + Date.now().toString(36);
-
-    const projectDir = path.join(__dirname, 'images', 'projects', folderSlug);
-    fs.mkdirSync(projectDir, { recursive: true });
+    const isVercel = Boolean(process.env.VERCEL);
 
     let labels = [];
     try {
@@ -428,22 +426,50 @@ app.post('/api/projects', requireAuth, upload.array('images', 20), async (req, r
     const angles = [];
     const files = req.files || [];
 
+    // Local directory (only created for non-serverless local disk storage)
+    let projectDir = null;
+    if (!isVercel) {
+      projectDir = path.join(__dirname, 'images', 'projects', folderSlug);
+      try {
+        fs.mkdirSync(projectDir, { recursive: true });
+      } catch (e) {}
+    }
+
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const indexNum = i + 1;
-      const angleDestName = `angle-${indexNum}${path.extname(file.path)}`;
-      const targetPath = path.join(projectDir, angleDestName);
-
-      // Move uploaded file to project folder
-      fs.renameSync(file.path, targetPath);
-
-      // Convert to WebP
-      const finalWebpPath = await convertImageToWebP(targetPath);
-      const finalFilename = path.basename(finalWebpPath);
-
       const label = labels[i] || `Angle 0${indexNum} — View`;
+      let angleSrc = '';
+
+      if (isVercel) {
+        // On Vercel: Read uploaded file into Base64 Data URI so it works 100% on serverless without disk writes
+        try {
+          const fileBuf = fs.readFileSync(file.path);
+          const mime = file.mimetype || 'image/jpeg';
+          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
+          try { fs.unlinkSync(file.path); } catch (e) {}
+        } catch (readErr) {
+          console.warn('Could not read buffer:', readErr.message);
+          angleSrc = `images/projects/${folderSlug}/angle-${indexNum}.jpg`;
+        }
+      } else {
+        // Local: Save file to disk and optimize with WebP
+        const angleDestName = `angle-${indexNum}${path.extname(file.path)}`;
+        const targetPath = path.join(projectDir, angleDestName);
+        try {
+          fs.renameSync(file.path, targetPath);
+          const finalWebpPath = await convertImageToWebP(targetPath);
+          const finalFilename = path.basename(finalWebpPath);
+          angleSrc = `images/projects/${folderSlug}/${finalFilename}`;
+        } catch (diskErr) {
+          const fileBuf = fs.readFileSync(file.path);
+          const mime = file.mimetype || 'image/jpeg';
+          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
+        }
+      }
+
       angles.push({
-        src: `images/projects/${folderSlug}/${finalFilename}`,
+        src: angleSrc,
         label: label
       });
     }
@@ -525,7 +551,7 @@ app.delete('/api/projects/:id', requireAuth, (req, res) => {
 });
 
 // POST /api/projects/:id/images - Add Angle/Image to existing project (Protected)
-app.post('/api/projects/:id/images', requireAuth, upload.array('images', 10), async (req, res) => {
+app.post(['/api/projects/:id/images', '/projects/:id/images'], requireAuth, upload.array('images', 10), async (req, res) => {
   try {
     const projects = readProjects();
     const project = projects.find(p => p.id === req.params.id);
@@ -539,8 +565,14 @@ app.post('/api/projects/:id/images', requireAuth, upload.array('images', 10), as
       return res.status(400).json({ success: false, message: 'No images uploaded.' });
     }
 
-    const projectDir = path.join(__dirname, 'images', 'projects', project.folder);
-    fs.mkdirSync(projectDir, { recursive: true });
+    const isVercel = Boolean(process.env.VERCEL);
+    let projectDir = null;
+    if (!isVercel) {
+      projectDir = path.join(__dirname, 'images', 'projects', project.folder);
+      try {
+        fs.mkdirSync(projectDir, { recursive: true });
+      } catch (e) {}
+    }
 
     let labels = [];
     try {
@@ -554,17 +586,35 @@ app.post('/api/projects/:id/images', requireAuth, upload.array('images', 10), as
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const nextIndex = project.angles.length + 1;
-      const angleDestName = `angle-${nextIndex}-${Date.now().toString(36)}${path.extname(file.path)}`;
-      const targetPath = path.join(projectDir, angleDestName);
-
-      fs.renameSync(file.path, targetPath);
-
-      const finalWebpPath = await convertImageToWebP(targetPath);
-      const finalFilename = path.basename(finalWebpPath);
-
       const label = labels[i] || req.body.label || `Angle 0${nextIndex} — View`;
+      let angleSrc = '';
+
+      if (isVercel) {
+        try {
+          const fileBuf = fs.readFileSync(file.path);
+          const mime = file.mimetype || 'image/jpeg';
+          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
+          try { fs.unlinkSync(file.path); } catch (e) {}
+        } catch (readErr) {
+          angleSrc = `images/projects/${project.folder}/angle-${nextIndex}.jpg`;
+        }
+      } else {
+        const angleDestName = `angle-${nextIndex}-${Date.now().toString(36)}${path.extname(file.path)}`;
+        const targetPath = path.join(projectDir, angleDestName);
+        try {
+          fs.renameSync(file.path, targetPath);
+          const finalWebpPath = await convertImageToWebP(targetPath);
+          const finalFilename = path.basename(finalWebpPath);
+          angleSrc = `images/projects/${project.folder}/${finalFilename}`;
+        } catch (diskErr) {
+          const fileBuf = fs.readFileSync(file.path);
+          const mime = file.mimetype || 'image/jpeg';
+          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
+        }
+      }
+
       project.angles.push({
-        src: `images/projects/${project.folder}/${finalFilename}`,
+        src: angleSrc,
         label: label
       });
     }
@@ -578,7 +628,7 @@ app.post('/api/projects/:id/images', requireAuth, upload.array('images', 10), as
 });
 
 // DELETE /api/projects/:id/images/:angleIndex - Remove Angle from project (Protected)
-app.delete('/api/projects/:id/images/:angleIndex', requireAuth, (req, res) => {
+app.delete(['/api/projects/:id/images/:angleIndex', '/projects/:id/images/:angleIndex'], requireAuth, (req, res) => {
   try {
     const projects = readProjects();
     const project = projects.find(p => p.id === req.params.id);
@@ -595,21 +645,18 @@ app.delete('/api/projects/:id/images/:angleIndex', requireAuth, (req, res) => {
     const removedAngle = project.angles[angleIndex];
     project.angles.splice(angleIndex, 1);
 
-    // Delete file from disk if path exists
-    if (removedAngle && removedAngle.src) {
-      const filePath = path.join(__dirname, removedAngle.src);
-      if (fs.existsSync(filePath)) {
-        try {
+    // Delete file from disk if path exists and not a data URI
+    if (removedAngle && removedAngle.src && !removedAngle.src.startsWith('data:')) {
+      try {
+        const filePath = path.join(__dirname, removedAngle.src);
+        if (fs.existsSync(filePath)) {
           fs.unlinkSync(filePath);
-        } catch (unErr) {
-          console.warn('Could not remove file:', unErr.message);
         }
-      }
-      // Also remove paired png if exists
-      const pngPath = filePath.replace(/\.webp$/i, '.png');
-      if (fs.existsSync(pngPath)) {
-        try { fs.unlinkSync(pngPath); } catch (e) {}
-      }
+        const pngPath = filePath.replace(/\.webp$/i, '.png');
+        if (fs.existsSync(pngPath)) {
+          fs.unlinkSync(pngPath);
+        }
+      } catch (e) {}
     }
 
     writeProjects(projects);
