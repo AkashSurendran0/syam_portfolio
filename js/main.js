@@ -482,24 +482,18 @@ document.addEventListener('DOMContentLoaded', () => {
   if (contactForm) {
     contactForm.addEventListener('submit', (e) => {
       e.preventDefault();
-      const name = document.querySelector('#formName').value;
-      const email = document.querySelector('#formEmail').value;
-      const phone = document.querySelector('#formPhone').value;
-      const desc = document.querySelector('#formDesc').value;
-
-      const checkedServices = [];
-      document.querySelectorAll('.chip-checkbox:checked').forEach(cb => {
-        checkedServices.push(cb.value);
-      });
+      const name = document.querySelector('#formName').value.trim();
+      const email = document.querySelector('#formEmail').value.trim();
+      const phone = document.querySelector('#formPhone').value.trim();
+      const desc = document.querySelector('#formDesc').value.trim();
 
       const subject = encodeURIComponent(`Design Inquiry from ${name}`);
       const body = encodeURIComponent(
         `Hi SyamKrishna,\n\n` +
-        `I would like to discuss an interior design project with you.\n\n` +
+        `I would like to discuss a project with you.\n\n` +
         `Client Name: ${name}\n` +
         `Email: ${email}\n` +
-        `Phone: ${phone}\n` +
-        `Services of Interest: ${checkedServices.join(', ') || 'General Consultation'}\n\n` +
+        `Phone: ${phone || 'Not provided'}\n\n` +
         `Project Details:\n${desc}\n\n` +
         `Best regards,\n${name}`
       );
