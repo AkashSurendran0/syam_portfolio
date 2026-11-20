@@ -4,6 +4,8 @@ const fs = require('fs');
 const multer = require('multer');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
+const cloudinary = require('cloudinary').v2;
+const { connectDB, Category, Project } = require('./models');
 require('dotenv').config();
 
 const app = express();
@@ -12,6 +14,56 @@ const SECRET_KEYWORD = (process.env.SECRET_KEYWORD || 'syam_interior_2026').trim
 
 // In-memory active session tokens: token -> { createdAt }
 const activeSessions = new Map();
+
+// Configure Cloudinary
+if (process.env.CLOUDINARY_URL) {
+  cloudinary.config({
+    cloudinary_url: process.env.CLOUDINARY_URL
+  });
+} else if (process.env.CLOUDINARY_CLOUD_NAME) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+  });
+}
+
+// Upload buffer directly to Cloudinary (No local folders needed!)
+function uploadToCloudinary(buffer, filename = 'image') {
+  return new Promise((resolve, reject) => {
+    const isCloudinaryConfigured = Boolean(
+      process.env.CLOUDINARY_URL ||
+      (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)
+    );
+
+    if (!isCloudinaryConfigured) {
+      console.warn('⚠️ Cloudinary credentials not found in .env, saving as Base64 Data URI fallback');
+      const base64 = buffer.toString('base64');
+      return resolve({
+        secure_url: `data:image/jpeg;base64,${base64}`,
+        public_id: ''
+      });
+    }
+
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'syam_portfolio/projects',
+        resource_type: 'image',
+        transformation: [
+          { quality: 'auto:good', fetch_format: 'auto' } // Auto WebP / compression
+        ]
+      },
+      (error, result) => {
+        if (error) {
+          console.error('Cloudinary upload error:', error);
+          return reject(error);
+        }
+        resolve(result);
+      }
+    );
+    uploadStream.end(buffer);
+  });
+}
 
 // Helper: Slugify string
 function slugify(text) {
@@ -25,7 +77,7 @@ function slugify(text) {
 }
 
 // ===================================================================
-// FILE STORAGE HELPERS (.JS FILES - ZERO DATABASE)
+// FILE STORAGE FALLBACK HELPERS
 // ===================================================================
 const CATEGORIES_FILE = path.join(__dirname, 'data', 'categories.js');
 const PROJECTS_FILE = path.join(__dirname, 'data', 'projects.js');
@@ -73,12 +125,11 @@ function writeCategories(categories) {
     delete require.cache[require.resolve(CATEGORIES_FILE)];
     return true;
   } catch (err) {
-    console.warn('Note: File write skipped (read-only filesystem on serverless):', err.message);
     return true;
   }
 }
 
-// Helper: Read Projects from .js file (zero db)
+// Helper: Read Projects from .js file
 function readProjects() {
   if (inMemoryProjects && Array.isArray(inMemoryProjects) && inMemoryProjects.length > 0) {
     return inMemoryProjects;
@@ -107,75 +158,30 @@ function readProjects() {
   }
 }
 
-// Helper: Write Projects to .js file (zero db)
+// Helper: Write Projects to .js file
 function writeProjects(projects) {
   inMemoryProjects = projects;
   try {
     const fileContent = `// Portfolio Projects Configuration (Stored in .js file)\nmodule.exports = ${JSON.stringify(projects, null, 2)};\n`;
     fs.writeFileSync(PROJECTS_FILE, fileContent, 'utf8');
     delete require.cache[require.resolve(PROJECTS_FILE)];
-    // Also keep JSON mirror synced
     try {
       fs.writeFileSync(PROJECTS_JSON, JSON.stringify(projects, null, 2), 'utf8');
     } catch(e) {}
     return true;
   } catch (err) {
-    console.warn('Note: File write skipped (read-only filesystem on serverless):', err.message);
     return true;
   }
 }
 
-// Helper: Async convert image to WebP using python Pillow script
-function convertImageToWebP(filePath) {
-  return new Promise((resolve) => {
-    const ext = path.extname(filePath).toLowerCase();
-    if (ext === '.webp') {
-      return resolve(filePath);
-    }
-    const scriptPath = path.join(__dirname, 'scripts', 'convert_webp.py');
-    execFile('python3', [scriptPath, filePath], (error, stdout) => {
-      if (error) {
-        console.warn('Pillow WebP conversion failed, using original file:', error.message);
-        return resolve(filePath);
-      }
-      const webpPath = stdout.trim();
-      if (fs.existsSync(webpPath)) {
-        resolve(webpPath);
-      } else {
-        resolve(filePath);
-      }
-    });
-  });
-}
-
-// Multer Storage Configuration
-const os = require('os');
-const tempUploadDir = process.env.VERCEL
-  ? path.join(os.tmpdir(), 'temp_uploads')
-  : path.join(__dirname, 'images', 'temp_uploads');
-
-try {
-  fs.mkdirSync(tempUploadDir, { recursive: true });
-} catch (e) {
-  // Graceful fallback for read-only serverless filesystems
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, tempUploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname);
-    cb(null, 'upload-' + uniqueSuffix + ext);
-  }
-});
+// Multer in-memory storage (Zero disk writes, zero folders!)
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max per file
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB max per image
   fileFilter: (req, file, cb) => {
-    const allowed = /jpeg|jpg|png|webp|gif/i;
+    const allowed = /jpeg|jpg|png|webp|gif|avif/i;
     const isExtAllowed = allowed.test(path.extname(file.originalname));
     const isMimeAllowed = allowed.test(file.mimetype);
     if (isExtAllowed && isMimeAllowed) {
@@ -274,39 +280,64 @@ app.post(['/api/auth/logout', '/auth/logout'], (req, res) => {
 });
 
 // ===================================================================
-// CATEGORIES API (Stored in data/categories.js - Zero DB)
+// CATEGORIES API (MongoDB with File Storage Fallback)
 // ===================================================================
 
 // GET /api/categories - Public
-app.get('/api/categories', (req, res) => {
+app.get(['/api/categories', '/categories'], async (req, res) => {
+  try {
+    const hasDB = await connectDB();
+    if (hasDB) {
+      let categories = await Category.find({}).sort({ createdAt: 1 }).lean();
+      if (!categories || categories.length === 0) {
+        // Auto-seed default categories on first MongoDB run
+        try {
+          await Category.insertMany(defaultCategories);
+          categories = await Category.find({}).sort({ createdAt: 1 }).lean();
+        } catch (seedErr) {}
+      }
+      if (categories && categories.length > 0) {
+        return res.json({ success: true, categories });
+      }
+    }
+  } catch (err) {
+    console.warn('DB categories fetch error, using fallback:', err.message);
+  }
   const categories = readCategories();
   res.json({ success: true, categories });
 });
 
 // POST /api/categories - Add Category (Protected)
-app.post('/api/categories', requireAuth, (req, res) => {
+app.post(['/api/categories', '/categories'], requireAuth, async (req, res) => {
   try {
     const { label, id } = req.body;
     if (!label || typeof label !== 'string' || !label.trim()) {
       return res.status(400).json({ success: false, message: 'Category label is required.' });
     }
 
-    const categories = readCategories();
     const categoryId = slugify(id || label);
-
     if (!categoryId) {
       return res.status(400).json({ success: false, message: 'Invalid category name.' });
     }
 
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const existing = await Category.findOne({ id: categoryId });
+      if (existing) {
+        return res.status(400).json({ success: false, message: `Category '${categoryId}' already exists.` });
+      }
+      const newCategory = await Category.create({ id: categoryId, label: label.trim() });
+      const allCategories = await Category.find({}).sort({ createdAt: 1 }).lean();
+      return res.status(201).json({ success: true, category: newCategory, categories: allCategories, message: 'Category added to MongoDB!' });
+    }
+
+    // Fallback file storage
+    const categories = readCategories();
     if (categories.some(c => c.id === categoryId)) {
       return res.status(400).json({ success: false, message: `Category '${categoryId}' already exists.` });
     }
 
-    const newCategory = {
-      id: categoryId,
-      label: label.trim()
-    };
-
+    const newCategory = { id: categoryId, label: label.trim() };
     categories.push(newCategory);
     writeCategories(categories);
 
@@ -318,16 +349,30 @@ app.post('/api/categories', requireAuth, (req, res) => {
 });
 
 // PUT /api/categories/:id - Edit Category Label (Protected)
-app.put('/api/categories/:id', requireAuth, (req, res) => {
+app.put(['/api/categories/:id', '/categories/:id'], requireAuth, async (req, res) => {
   try {
     const { label } = req.body;
     if (!label || typeof label !== 'string' || !label.trim()) {
       return res.status(400).json({ success: false, message: 'Category label is required.' });
     }
 
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const updated = await Category.findOneAndUpdate(
+        { id: req.params.id },
+        { label: label.trim() },
+        { new: true }
+      ).lean();
+      if (!updated) {
+        return res.status(404).json({ success: false, message: 'Category not found.' });
+      }
+      const allCategories = await Category.find({}).sort({ createdAt: 1 }).lean();
+      return res.json({ success: true, category: updated, categories: allCategories, message: 'Category updated in MongoDB!' });
+    }
+
+    // Fallback
     const categories = readCategories();
     const cat = categories.find(c => c.id === req.params.id);
-
     if (!cat) {
       return res.status(404).json({ success: false, message: 'Category not found.' });
     }
@@ -343,36 +388,35 @@ app.put('/api/categories/:id', requireAuth, (req, res) => {
 });
 
 // DELETE /api/categories/:id - Delete Category (Protected)
-app.delete('/api/categories/:id', requireAuth, (req, res) => {
+app.delete(['/api/categories/:id', '/categories/:id'], requireAuth, async (req, res) => {
   try {
-    const categories = readCategories();
     const catId = req.params.id;
-    const index = categories.findIndex(c => c.id === catId);
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const count = await Category.countDocuments();
+      if (count <= 1) {
+        return res.status(400).json({ success: false, message: 'At least one category must remain.' });
+      }
+      const deleted = await Category.findOneAndDelete({ id: catId }).lean();
+      if (!deleted) {
+        return res.status(404).json({ success: false, message: 'Category not found.' });
+      }
+      const allCategories = await Category.find({}).sort({ createdAt: 1 }).lean();
+      return res.json({ success: true, deleted, categories: allCategories, message: `Category '${deleted.label}' deleted.` });
+    }
 
+    // Fallback
+    const categories = readCategories();
+    const index = categories.findIndex(c => c.id === catId);
     if (index === -1) {
       return res.status(404).json({ success: false, message: 'Category not found.' });
     }
-
     if (categories.length <= 1) {
       return res.status(400).json({ success: false, message: 'At least one category must remain.' });
     }
 
     const deleted = categories.splice(index, 1)[0];
     writeCategories(categories);
-
-    // Reassign projects with deleted category to first remaining category
-    const projects = readProjects();
-    const fallbackCategory = categories[0].id;
-    let projectsModified = false;
-    projects.forEach(p => {
-      if (p.category === catId) {
-        p.category = fallbackCategory;
-        projectsModified = true;
-      }
-    });
-    if (projectsModified) {
-      writeProjects(projects);
-    }
 
     res.json({ success: true, deleted, categories, message: `Category '${deleted.label}' deleted.` });
   } catch (err) {
@@ -382,17 +426,38 @@ app.delete('/api/categories/:id', requireAuth, (req, res) => {
 });
 
 // ===================================================================
-// PROJECTS API (CRUD)
+// PROJECTS API (MongoDB + Cloudinary CDN)
 // ===================================================================
 
 // GET /api/projects - Public
-app.get('/api/projects', (req, res) => {
+app.get(['/api/projects', '/projects'], async (req, res) => {
+  try {
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const projects = await Project.find({}).sort({ createdAt: -1 }).lean();
+      return res.json({ success: true, projects });
+    }
+  } catch (err) {
+    console.warn('DB projects fetch error, using fallback:', err.message);
+  }
   const projects = readProjects();
   res.json({ success: true, projects });
 });
 
 // GET /api/projects/:id - Public
-app.get('/api/projects/:id', (req, res) => {
+app.get(['/api/projects/:id', '/projects/:id'], async (req, res) => {
+  try {
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const project = await Project.findOne({ id: req.params.id }).lean();
+      if (!project) {
+        return res.status(404).json({ success: false, message: 'Project not found' });
+      }
+      return res.json({ success: true, project });
+    }
+  } catch (err) {
+    console.warn('DB project fetch error:', err.message);
+  }
   const projects = readProjects();
   const project = projects.find(p => p.id === req.params.id);
   if (!project) {
@@ -401,18 +466,16 @@ app.get('/api/projects/:id', (req, res) => {
   res.json({ success: true, project });
 });
 
-// POST /api/projects - Create Project (Protected)
+// POST /api/projects - Create Project (Protected) -> Uploads to Cloudinary, saves to MongoDB
 app.post(['/api/projects', '/projects'], requireAuth, upload.array('images', 20), async (req, res) => {
   try {
     const { title, category, folderName, customLabels } = req.body;
-    if (!title) {
+    if (!title || !title.trim()) {
       return res.status(400).json({ success: false, message: 'Project title is required.' });
     }
 
-    const projects = readProjects();
     const folderSlug = slugify(folderName || title);
     const projectId = folderSlug + '-' + Date.now().toString(36);
-    const isVercel = Boolean(process.env.VERCEL);
 
     let labels = [];
     try {
@@ -426,55 +489,21 @@ app.post(['/api/projects', '/projects'], requireAuth, upload.array('images', 20)
     const angles = [];
     const files = req.files || [];
 
-    // Local directory (only created for non-serverless local disk storage)
-    let projectDir = null;
-    if (!isVercel) {
-      projectDir = path.join(__dirname, 'images', 'projects', folderSlug);
-      try {
-        fs.mkdirSync(projectDir, { recursive: true });
-      } catch (e) {}
-    }
-
+    // Upload each image buffer directly to Cloudinary (No local folders needed!)
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const indexNum = i + 1;
       const label = labels[i] || `Angle 0${indexNum} — View`;
-      let angleSrc = '';
 
-      if (isVercel) {
-        // On Vercel: Read uploaded file into Base64 Data URI so it works 100% on serverless without disk writes
-        try {
-          const fileBuf = fs.readFileSync(file.path);
-          const mime = file.mimetype || 'image/jpeg';
-          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
-          try { fs.unlinkSync(file.path); } catch (e) {}
-        } catch (readErr) {
-          console.warn('Could not read buffer:', readErr.message);
-          angleSrc = `images/projects/${folderSlug}/angle-${indexNum}.jpg`;
-        }
-      } else {
-        // Local: Save file to disk and optimize with WebP
-        const angleDestName = `angle-${indexNum}${path.extname(file.path)}`;
-        const targetPath = path.join(projectDir, angleDestName);
-        try {
-          fs.renameSync(file.path, targetPath);
-          const finalWebpPath = await convertImageToWebP(targetPath);
-          const finalFilename = path.basename(finalWebpPath);
-          angleSrc = `images/projects/${folderSlug}/${finalFilename}`;
-        } catch (diskErr) {
-          const fileBuf = fs.readFileSync(file.path);
-          const mime = file.mimetype || 'image/jpeg';
-          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
-        }
-      }
-
+      const uploadResult = await uploadToCloudinary(file.buffer, `angle-${indexNum}`);
       angles.push({
-        src: angleSrc,
+        src: uploadResult.secure_url,
+        publicId: uploadResult.public_id || '',
         label: label
       });
     }
 
-    const newProject = {
+    const newProjectData = {
       id: projectId,
       title: title.trim(),
       category: category || 'residential',
@@ -482,10 +511,18 @@ app.post(['/api/projects', '/projects'], requireAuth, upload.array('images', 20)
       angles: angles
     };
 
-    projects.unshift(newProject);
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const created = await Project.create(newProjectData);
+      return res.status(201).json({ success: true, project: created, message: 'Project created in MongoDB with Cloudinary images!' });
+    }
+
+    // Fallback file storage
+    const projects = readProjects();
+    projects.unshift(newProjectData);
     writeProjects(projects);
 
-    res.status(201).json({ success: true, project: newProject, message: 'Project created successfully!' });
+    res.status(201).json({ success: true, project: newProjectData, message: 'Project created successfully!' });
   } catch (err) {
     console.error('Error creating project:', err);
     res.status(500).json({ success: false, message: 'Server error creating project: ' + err.message });
@@ -493,21 +530,36 @@ app.post(['/api/projects', '/projects'], requireAuth, upload.array('images', 20)
 });
 
 // PUT /api/projects/:id - Update Project Metadata & Angles (Protected)
-app.put('/api/projects/:id', requireAuth, (req, res) => {
+app.put(['/api/projects/:id', '/projects/:id'], requireAuth, async (req, res) => {
   try {
     const { title, category, angles } = req.body;
+    const updateFields = {};
+    if (title && title.trim()) updateFields.title = title.trim();
+    if (category) updateFields.category = category;
+    if (Array.isArray(angles)) updateFields.angles = angles;
+
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const updated = await Project.findOneAndUpdate(
+        { id: req.params.id },
+        updateFields,
+        { new: true }
+      ).lean();
+      if (!updated) {
+        return res.status(404).json({ success: false, message: 'Project not found.' });
+      }
+      return res.json({ success: true, project: updated, message: 'Project updated in MongoDB!' });
+    }
+
+    // Fallback
     const projects = readProjects();
     const index = projects.findIndex(p => p.id === req.params.id);
-
     if (index === -1) {
       return res.status(404).json({ success: false, message: 'Project not found.' });
     }
-
     if (title) projects[index].title = title.trim();
     if (category) projects[index].category = category;
-    if (Array.isArray(angles)) {
-      projects[index].angles = angles;
-    }
+    if (Array.isArray(angles)) projects[index].angles = angles;
 
     writeProjects(projects);
     res.json({ success: true, project: projects[index], message: 'Project updated successfully.' });
@@ -518,31 +570,34 @@ app.put('/api/projects/:id', requireAuth, (req, res) => {
 });
 
 // DELETE /api/projects/:id - Delete Project (Protected)
-app.delete('/api/projects/:id', requireAuth, (req, res) => {
+app.delete(['/api/projects/:id', '/projects/:id'], requireAuth, async (req, res) => {
   try {
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const project = await Project.findOneAndDelete({ id: req.params.id });
+      if (!project) {
+        return res.status(404).json({ success: false, message: 'Project not found.' });
+      }
+
+      // Delete images from Cloudinary if publicId exists
+      if (Array.isArray(project.angles)) {
+        for (const angle of project.angles) {
+          if (angle.publicId) {
+            try { await cloudinary.uploader.destroy(angle.publicId); } catch (e) {}
+          }
+        }
+      }
+      return res.json({ success: true, message: 'Project and Cloudinary images deleted successfully.' });
+    }
+
+    // Fallback
     const projects = readProjects();
     const index = projects.findIndex(p => p.id === req.params.id);
-
     if (index === -1) {
       return res.status(404).json({ success: false, message: 'Project not found.' });
     }
-
-    const deletedProject = projects[index];
     projects.splice(index, 1);
     writeProjects(projects);
-
-    // Remove folder if exists
-    if (deletedProject.folder) {
-      const folderPath = path.join(__dirname, 'images', 'projects', deletedProject.folder);
-      if (fs.existsSync(folderPath)) {
-        try {
-          fs.rmSync(folderPath, { recursive: true, force: true });
-        } catch (rmErr) {
-          console.warn('Could not remove folder:', rmErr.message);
-        }
-      }
-    }
-
     res.json({ success: true, message: 'Project deleted successfully.' });
   } catch (err) {
     console.error('Error deleting project:', err);
@@ -553,25 +608,9 @@ app.delete('/api/projects/:id', requireAuth, (req, res) => {
 // POST /api/projects/:id/images - Add Angle/Image to existing project (Protected)
 app.post(['/api/projects/:id/images', '/projects/:id/images'], requireAuth, upload.array('images', 10), async (req, res) => {
   try {
-    const projects = readProjects();
-    const project = projects.find(p => p.id === req.params.id);
-
-    if (!project) {
-      return res.status(404).json({ success: false, message: 'Project not found.' });
-    }
-
     const files = req.files || [];
     if (files.length === 0) {
       return res.status(400).json({ success: false, message: 'No images uploaded.' });
-    }
-
-    const isVercel = Boolean(process.env.VERCEL);
-    let projectDir = null;
-    if (!isVercel) {
-      projectDir = path.join(__dirname, 'images', 'projects', project.folder);
-      try {
-        fs.mkdirSync(projectDir, { recursive: true });
-      } catch (e) {}
     }
 
     let labels = [];
@@ -583,38 +622,46 @@ app.post(['/api/projects/:id/images', '/projects/:id/images'], requireAuth, uplo
       labels = [];
     }
 
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const project = await Project.findOne({ id: req.params.id });
+      if (!project) {
+        return res.status(404).json({ success: false, message: 'Project not found.' });
+      }
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const nextIndex = project.angles.length + 1;
+        const label = labels[i] || req.body.label || `Angle 0${nextIndex} — View`;
+
+        const uploadResult = await uploadToCloudinary(file.buffer, `angle-${nextIndex}`);
+        project.angles.push({
+          src: uploadResult.secure_url,
+          publicId: uploadResult.public_id || '',
+          label: label
+        });
+      }
+
+      await project.save();
+      return res.json({ success: true, project, message: 'Images uploaded to Cloudinary and added to project!' });
+    }
+
+    // Fallback
+    const projects = readProjects();
+    const project = projects.find(p => p.id === req.params.id);
+    if (!project) {
+      return res.status(404).json({ success: false, message: 'Project not found.' });
+    }
+
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const nextIndex = project.angles.length + 1;
       const label = labels[i] || req.body.label || `Angle 0${nextIndex} — View`;
-      let angleSrc = '';
 
-      if (isVercel) {
-        try {
-          const fileBuf = fs.readFileSync(file.path);
-          const mime = file.mimetype || 'image/jpeg';
-          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
-          try { fs.unlinkSync(file.path); } catch (e) {}
-        } catch (readErr) {
-          angleSrc = `images/projects/${project.folder}/angle-${nextIndex}.jpg`;
-        }
-      } else {
-        const angleDestName = `angle-${nextIndex}-${Date.now().toString(36)}${path.extname(file.path)}`;
-        const targetPath = path.join(projectDir, angleDestName);
-        try {
-          fs.renameSync(file.path, targetPath);
-          const finalWebpPath = await convertImageToWebP(targetPath);
-          const finalFilename = path.basename(finalWebpPath);
-          angleSrc = `images/projects/${project.folder}/${finalFilename}`;
-        } catch (diskErr) {
-          const fileBuf = fs.readFileSync(file.path);
-          const mime = file.mimetype || 'image/jpeg';
-          angleSrc = `data:${mime};base64,${fileBuf.toString('base64')}`;
-        }
-      }
-
+      const uploadResult = await uploadToCloudinary(file.buffer, `angle-${nextIndex}`);
       project.angles.push({
-        src: angleSrc,
+        src: uploadResult.secure_url,
+        publicId: uploadResult.public_id || '',
         label: label
       });
     }
@@ -628,35 +675,41 @@ app.post(['/api/projects/:id/images', '/projects/:id/images'], requireAuth, uplo
 });
 
 // DELETE /api/projects/:id/images/:angleIndex - Remove Angle from project (Protected)
-app.delete(['/api/projects/:id/images/:angleIndex', '/projects/:id/images/:angleIndex'], requireAuth, (req, res) => {
+app.delete(['/api/projects/:id/images/:angleIndex', '/projects/:id/images/:angleIndex'], requireAuth, async (req, res) => {
   try {
+    const angleIndex = parseInt(req.params.angleIndex, 10);
+    const hasDB = await connectDB();
+    if (hasDB) {
+      const project = await Project.findOne({ id: req.params.id });
+      if (!project) {
+        return res.status(404).json({ success: false, message: 'Project not found.' });
+      }
+      if (isNaN(angleIndex) || angleIndex < 0 || angleIndex >= project.angles.length) {
+        return res.status(400).json({ success: false, message: 'Invalid angle index.' });
+      }
+
+      const [removedAngle] = project.angles.splice(angleIndex, 1);
+      if (removedAngle && removedAngle.publicId) {
+        try { await cloudinary.uploader.destroy(removedAngle.publicId); } catch (e) {}
+      }
+
+      await project.save();
+      return res.json({ success: true, project, message: 'Image angle removed from project and Cloudinary.' });
+    }
+
+    // Fallback
     const projects = readProjects();
     const project = projects.find(p => p.id === req.params.id);
-
     if (!project) {
       return res.status(404).json({ success: false, message: 'Project not found.' });
     }
-
-    const angleIndex = parseInt(req.params.angleIndex, 10);
     if (isNaN(angleIndex) || angleIndex < 0 || angleIndex >= project.angles.length) {
       return res.status(400).json({ success: false, message: 'Invalid angle index.' });
     }
 
-    const removedAngle = project.angles[angleIndex];
-    project.angles.splice(angleIndex, 1);
-
-    // Delete file from disk if path exists and not a data URI
-    if (removedAngle && removedAngle.src && !removedAngle.src.startsWith('data:')) {
-      try {
-        const filePath = path.join(__dirname, removedAngle.src);
-        if (fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
-        const pngPath = filePath.replace(/\.webp$/i, '.png');
-        if (fs.existsSync(pngPath)) {
-          fs.unlinkSync(pngPath);
-        }
-      } catch (e) {}
+    const [removedAngle] = project.angles.splice(angleIndex, 1);
+    if (removedAngle && removedAngle.publicId) {
+      try { await cloudinary.uploader.destroy(removedAngle.publicId); } catch (e) {}
     }
 
     writeProjects(projects);
