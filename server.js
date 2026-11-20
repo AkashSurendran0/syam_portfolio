@@ -219,14 +219,21 @@ function requireAuth(req, res, next) {
 // AUTH ROUTES
 // ===================================================================
 
-// Login: Compare secretKeyword with process.env.SECRET_KEYWORD
+// Login: Compare SHA-256 hash of secretKeyword (client sends hash, never plaintext)
 app.post('/api/auth/login', (req, res) => {
-  const { secretKeyword } = req.body;
-  if (!secretKeyword || typeof secretKeyword !== 'string') {
+  const { keyHash } = req.body;
+  if (!keyHash || typeof keyHash !== 'string') {
     return res.status(400).json({ success: false, message: 'Secret keyword is required.' });
   }
 
-  if (secretKeyword.trim() === SECRET_KEYWORD) {
+  // Hash the server-side secret for constant-time comparison
+  const expectedHash = crypto.createHash('sha256').update(SECRET_KEYWORD).digest('hex');
+  const isValid = crypto.timingSafeEqual(
+    Buffer.from(keyHash.toLowerCase(), 'hex'),
+    Buffer.from(expectedHash, 'hex')
+  );
+
+  if (isValid) {
     const token = crypto.randomBytes(32).toString('hex');
     activeSessions.set(token, { createdAt: Date.now() });
     return res.json({ success: true, token, message: 'Authentication successful.' });

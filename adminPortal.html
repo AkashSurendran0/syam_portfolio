@@ -1054,6 +1054,16 @@
             document.getElementById('dashboardScreen').style.display = 'block';
         }
 
+        // Hash a string with SHA-256 using Web Crypto API (never send plaintext)
+        async function sha256hex(str) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(str);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+            return Array.from(new Uint8Array(hashBuffer))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
+        }
+
         // Handle Login Submission
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -1066,10 +1076,12 @@
             errBox.style.display = 'none';
 
             try {
+                // Hash keyword before sending — plaintext never leaves the browser
+                const keyHash = await sha256hex(keyword);
                 const res = await fetch('/api/auth/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ secretKeyword: keyword })
+                    body: JSON.stringify({ keyHash })
                 });
                 const data = await res.json();
 
