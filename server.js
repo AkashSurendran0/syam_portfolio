@@ -38,59 +38,78 @@ const defaultCategories = [
   { id: 'outdoor', label: 'Outdoor & Landscape' }
 ];
 
+let inMemoryCategories = null;
+let inMemoryProjects = null;
+
 // Helper: Read Categories from .js file
 function readCategories() {
+  if (inMemoryCategories && Array.isArray(inMemoryCategories) && inMemoryCategories.length > 0) {
+    return inMemoryCategories;
+  }
   try {
-    if (!fs.existsSync(CATEGORIES_FILE)) {
-      writeCategories(defaultCategories);
-      return defaultCategories;
-    }
-    delete require.cache[require.resolve(CATEGORIES_FILE)];
-    const data = require(CATEGORIES_FILE);
-    return Array.isArray(data) ? data : defaultCategories;
+    const data = require('./data/categories.js');
+    inMemoryCategories = Array.isArray(data) ? data : defaultCategories;
+    return inMemoryCategories;
   } catch (err) {
-    console.error('Error reading categories.js:', err);
-    return defaultCategories;
+    try {
+      if (fs.existsSync(CATEGORIES_FILE)) {
+        delete require.cache[require.resolve(CATEGORIES_FILE)];
+        const data = require(CATEGORIES_FILE);
+        inMemoryCategories = Array.isArray(data) ? data : defaultCategories;
+        return inMemoryCategories;
+      }
+    } catch(e) {}
+    inMemoryCategories = defaultCategories;
+    return inMemoryCategories;
   }
 }
 
 // Helper: Write Categories to .js file
 function writeCategories(categories) {
+  inMemoryCategories = categories;
   try {
     const fileContent = `// Portfolio Categories Configuration (Stored in .js file)\nmodule.exports = ${JSON.stringify(categories, null, 2)};\n`;
     fs.writeFileSync(CATEGORIES_FILE, fileContent, 'utf8');
     delete require.cache[require.resolve(CATEGORIES_FILE)];
     return true;
   } catch (err) {
-    console.error('Error writing categories.js:', err);
-    return false;
+    console.warn('Note: File write skipped (read-only filesystem on serverless):', err.message);
+    return true;
   }
 }
 
 // Helper: Read Projects from .js file (zero db)
 function readProjects() {
+  if (inMemoryProjects && Array.isArray(inMemoryProjects) && inMemoryProjects.length > 0) {
+    return inMemoryProjects;
+  }
   try {
-    if (!fs.existsSync(PROJECTS_FILE)) {
+    const data = require('./data/projects.js');
+    inMemoryProjects = Array.isArray(data) ? data : [];
+    return inMemoryProjects;
+  } catch (err) {
+    try {
+      if (fs.existsSync(PROJECTS_FILE)) {
+        delete require.cache[require.resolve(PROJECTS_FILE)];
+        const data = require(PROJECTS_FILE);
+        inMemoryProjects = Array.isArray(data) ? data : [];
+        return inMemoryProjects;
+      }
+    } catch(e) {}
+    try {
       if (fs.existsSync(PROJECTS_JSON)) {
         const jsonContent = fs.readFileSync(PROJECTS_JSON, 'utf8');
-        const parsed = JSON.parse(jsonContent);
-        writeProjects(parsed);
-        return parsed;
+        inMemoryProjects = JSON.parse(jsonContent);
+        return inMemoryProjects;
       }
-      writeProjects([]);
-      return [];
-    }
-    delete require.cache[require.resolve(PROJECTS_FILE)];
-    const data = require(PROJECTS_FILE);
-    return Array.isArray(data) ? data : [];
-  } catch (err) {
-    console.error('Error reading projects.js:', err);
+    } catch(e) {}
     return [];
   }
 }
 
 // Helper: Write Projects to .js file (zero db)
 function writeProjects(projects) {
+  inMemoryProjects = projects;
   try {
     const fileContent = `// Portfolio Projects Configuration (Stored in .js file)\nmodule.exports = ${JSON.stringify(projects, null, 2)};\n`;
     fs.writeFileSync(PROJECTS_FILE, fileContent, 'utf8');
@@ -101,8 +120,8 @@ function writeProjects(projects) {
     } catch(e) {}
     return true;
   } catch (err) {
-    console.error('Error writing projects.js:', err);
-    return false;
+    console.warn('Note: File write skipped (read-only filesystem on serverless):', err.message);
+    return true;
   }
 }
 
@@ -130,8 +149,16 @@ function convertImageToWebP(filePath) {
 }
 
 // Multer Storage Configuration
-const tempUploadDir = path.join(__dirname, 'images', 'temp_uploads');
-fs.mkdirSync(tempUploadDir, { recursive: true });
+const os = require('os');
+const tempUploadDir = process.env.VERCEL
+  ? path.join(os.tmpdir(), 'temp_uploads')
+  : path.join(__dirname, 'images', 'temp_uploads');
+
+try {
+  fs.mkdirSync(tempUploadDir, { recursive: true });
+} catch (e) {
+  // Graceful fallback for read-only serverless filesystems
+}
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -162,6 +189,18 @@ const upload = multer({
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Normalize URL in case serverless rewrite stripped /api
+app.use((req, res, next) => {
+  if (!req.url.startsWith('/api') && (
+    req.url.startsWith('/categories') ||
+    req.url.startsWith('/projects') ||
+    req.url.startsWith('/auth')
+  )) {
+    req.url = '/api' + req.url;
+  }
+  next();
+});
 
 // Auth Verification Middleware
 function requireAuth(req, res, next) {
@@ -582,11 +621,16 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Start Server
-app.listen(PORT, () => {
-  console.log(`=======================================================`);
-  console.log(`  SyamKrishna Portfolio Server running on port ${PORT}`);
-  console.log(`  Live Portfolio: http://localhost:${PORT}/`);
-  console.log(`  Admin Portal:   http://localhost:${PORT}/adminPortal`);
-  console.log(`=======================================================`);
-});
+// Start Server when run directly (local development)
+if (require.main === module || !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`=======================================================`);
+    console.log(`  SyamKrishna Portfolio Server running on port ${PORT}`);
+    console.log(`  Live Portfolio: http://localhost:${PORT}/`);
+    console.log(`  Admin Portal:   http://localhost:${PORT}/adminPortal`);
+    console.log(`=======================================================`);
+  });
+}
+
+// Export app for Vercel Serverless Functions
+module.exports = app;

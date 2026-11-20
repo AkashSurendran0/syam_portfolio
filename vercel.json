@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "data/**"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/adminPortal",
+      "destination": "/adminPortal.html"
+    },
+    {
+      "source": "/adminportal",
+      "destination": "/adminPortal.html"
+    }
+  ]
+}
