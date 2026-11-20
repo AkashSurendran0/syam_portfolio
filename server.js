@@ -605,21 +605,29 @@ app.delete('/api/projects/:id/images/:angleIndex', requireAuth, (req, res) => {
 });
 
 // ===================================================================
-// HTML ROUTING & STATIC ASSETS
+// HTML ROUTING & STATIC ASSETS (local dev only — Vercel CDN handles static)
 // ===================================================================
 
-// Route for /adminPortal
-app.get(['/adminPortal', '/adminPortal.html', '/adminportal'], (req, res) => {
-  res.sendFile(path.join(__dirname, 'adminPortal.html'));
-});
+if (!process.env.VERCEL) {
+  // Route for /adminPortal (local dev)
+  app.get(['/adminPortal', '/adminPortal.html', '/adminportal'], (req, res) => {
+    res.sendFile(path.join(__dirname, 'adminPortal.html'));
+  });
 
-// Static assets
-app.use(express.static(__dirname));
+  // Static assets (local dev)
+  app.use(express.static(__dirname));
 
-// Fallback to index.html for SPA/client routing
-app.use((req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
+  // Fallback to index.html for SPA/client routing (local dev)
+  app.use((req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+  });
+} else {
+  // On Vercel: only handle API routes; static files served by Vercel CDN.
+  // Return 404 for any non-API route that slips through.
+  app.use((req, res) => {
+    res.status(404).json({ error: 'Not found', note: 'Static assets are served by Vercel CDN.' });
+  });
+}
 
 // Start Server when run directly (local development)
 if (require.main === module || !process.env.VERCEL) {
