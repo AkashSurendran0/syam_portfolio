@@ -1487,6 +1487,87 @@
             renderCreateFilesPreview();
         };
 
+        // Safe JSON parser for API responses (handles non-JSON 413/500 proxy responses cleanly)
+        async function parseApiResponse(res) {
+            const text = await res.text();
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                if (res.status === 413) {
+                    throw new Error('Upload payload exceeded server limit (4.5 MB). Try fewer or smaller images.');
+                }
+                const snippet = text ? text.replace(/<[^>]+>/g, ' ').trim().slice(0, 140) : res.statusText;
+                throw new Error(`HTTP ${res.status}: ${snippet || 'Unexpected server response'}`);
+            }
+        }
+
+        // Compress/resize large camera photos in-browser so mobile uploads stay fast and under serverless limits
+        async function compressImageFile(file, maxDimension = 2400, quality = 0.86) {
+            const skipCompression = file.size <= 1.2 * 1024 * 1024;
+            if (skipCompression) return file;
+
+            return new Promise((resolve) => {
+                const objectUrl = URL.createObjectURL(file);
+                const img = new Image();
+                img.onload = () => {
+                    try {
+                        let { width, height } = img;
+                        if (width > maxDimension || height > maxDimension) {
+                            const scale = maxDimension / Math.max(width, height);
+                            width = Math.round(width * scale);
+                            height = Math.round(height * scale);
+                        }
+                        const canvas = document.createElement('canvas');
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+
+                        const outputType = 'image/jpeg';
+                        const baseName = (file.name || 'image').replace(/\.[^.]+$/, '');
+                        canvas.toBlob((blob) => {
+                            URL.revokeObjectURL(objectUrl);
+                            if (blob && blob.size < file.size) {
+                                resolve(new File([blob], `${baseName}.jpg`, { type: outputType }));
+                            } else {
+                                resolve(file);
+                            }
+                        }, outputType, quality);
+                    } catch (err) {
+                        URL.revokeObjectURL(objectUrl);
+                        resolve(file);
+                    }
+                };
+                img.onerror = () => {
+                    URL.revokeObjectURL(objectUrl);
+                    resolve(file);
+                };
+                img.src = objectUrl;
+            });
+        }
+
+        // Split files into <= 3 MB batches to stay safely below Vercel's 4.5 MB serverless body limit
+        function chunkFilesByBytes(files, maxBatchBytes = 3 * 1024 * 1024) {
+            const batches = [];
+            let current = [];
+            let currentSize = 0;
+
+            for (const file of files) {
+                if (file.size > 4.2 * 1024 * 1024) {
+                    throw new Error(`"${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) is too large to upload in this format. Please convert or resize it under 4 MB.`);
+                }
+                if (current.length > 0 && currentSize + file.size > maxBatchBytes) {
+                    batches.push(current);
+                    current = [];
+                    currentSize = 0;
+                }
+                current.push(file);
+                currentSize += file.size;
+            }
+            if (current.length > 0) batches.push(current);
+            return batches;
+        }
+
         document.getElementById('openCreateBtn').addEventListener('click', () => {
             createSelectedFiles = [];
             document.getElementById('createProjectForm').reset();
@@ -1506,35 +1587,63 @@
 
             const btn = document.getElementById('saveCreateBtn');
             btn.disabled = true;
-            btn.textContent = 'Creating & Optimizing...';
-
-            const formData = new FormData();
-            formData.append('title', title);
-            formData.append('category', category);
-
-            createSelectedFiles.forEach(f => {
-                formData.append('images', f);
-            });
+            btn.textContent = 'Optimizing images...';
 
             const token = getAuthToken();
 
             try {
+                const preparedFiles = [];
+                for (const file of createSelectedFiles) {
+                    preparedFiles.push(await compressImageFile(file));
+                }
+                const batches = chunkFilesByBytes(preparedFiles);
+
+                btn.textContent = batches.length > 1
+                    ? `Uploading batch 1/${batches.length}...`
+                    : 'Creating & Uploading...';
+
+                const firstFormData = new FormData();
+                firstFormData.append('title', title);
+                firstFormData.append('category', category);
+                batches[0].forEach(f => firstFormData.append('images', f));
+
                 const res = await fetch('/api/projects', {
                     method: 'POST',
                     headers: { 'Authorization': `Bearer ${token}` },
-                    body: formData
+                    body: firstFormData
                 });
-                const data = await res.json();
-                if (data.success) {
-                    showToast('Project created & converted to WebP successfully!');
-                    closeModal('createModal');
-                    loadProjects();
-                } else {
+                const data = await parseApiResponse(res);
+                if (!data.success) {
                     alert(data.message || 'Error creating project');
+                    return;
                 }
+
+                const createdId = data.project && data.project.id;
+                for (let b = 1; b < batches.length; b++) {
+                    btn.textContent = `Uploading batch ${b + 1}/${batches.length}...`;
+                    const batchFormData = new FormData();
+                    batches[b].forEach(f => batchFormData.append('images', f));
+
+                    const batchRes = await fetch(`/api/projects/${createdId}/images`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${token}` },
+                        body: batchFormData
+                    });
+                    const batchData = await parseApiResponse(batchRes);
+                    if (!batchData.success) {
+                        closeModal('createModal');
+                        loadProjects();
+                        alert(batchData.message || `Project was created, but uploading batch ${b + 1} failed. You can add the remaining images via Edit & Angles.`);
+                        return;
+                    }
+                }
+
+                showToast('Project created & uploaded to Cloudinary successfully!');
+                closeModal('createModal');
+                loadProjects();
             } catch (err) {
                 console.error(err);
-                alert('Server error creating project');
+                alert(err.message || 'Server error creating project');
             } finally {
                 btn.disabled = false;
                 btn.textContent = 'Create Project';
@@ -1625,32 +1734,42 @@
             if (!files || files.length === 0) return;
 
             const token = getAuthToken();
-            const formData = new FormData();
-            for (let i = 0; i < files.length; i++) {
-                formData.append('images', files[i]);
-            }
-
             editAddAngleBtn.disabled = true;
-            editAddAngleBtn.textContent = 'Uploading...';
+            editAddAngleBtn.textContent = 'Optimizing...';
 
             try {
-                const res = await fetch(`/api/projects/${activeEditProject.id}/images`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${token}` },
-                    body: formData
-                });
-                const data = await res.json();
-                if (data.success) {
-                    activeEditProject = data.project;
-                    renderEditAngles();
-                    loadProjects();
-                    showToast('New image angles added & optimized!');
-                } else {
-                    alert(data.message || 'Error uploading angle');
+                const preparedFiles = [];
+                for (let i = 0; i < files.length; i++) {
+                    preparedFiles.push(await compressImageFile(files[i]));
                 }
+                const batches = chunkFilesByBytes(preparedFiles);
+
+                for (let b = 0; b < batches.length; b++) {
+                    editAddAngleBtn.textContent = batches.length > 1
+                        ? `Uploading ${b + 1}/${batches.length}...`
+                        : 'Uploading...';
+                    const formData = new FormData();
+                    batches[b].forEach(f => formData.append('images', f));
+
+                    const res = await fetch(`/api/projects/${activeEditProject.id}/images`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${token}` },
+                        body: formData
+                    });
+                    const data = await parseApiResponse(res);
+                    if (!data.success) {
+                        alert(data.message || 'Error uploading angle');
+                        return;
+                    }
+                    activeEditProject = data.project;
+                }
+
+                renderEditAngles();
+                loadProjects();
+                showToast('New image angles added & optimized!');
             } catch (err) {
                 console.error(err);
-                alert('Server error uploading angle');
+                alert(err.message || 'Server error uploading angle');
             } finally {
                 editAddAngleBtn.disabled = false;
                 editAddAngleBtn.textContent = '+ Add Image Angle';

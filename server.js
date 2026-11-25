@@ -239,13 +239,17 @@ const upload = multer({
   storage,
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB max per image
   fileFilter: (req, file, cb) => {
-    const allowed = /jpeg|jpg|png|webp|gif|avif/i;
-    const isExtAllowed = allowed.test(path.extname(file.originalname));
-    const isMimeAllowed = allowed.test(file.mimetype);
-    if (isExtAllowed && isMimeAllowed) {
+    const allowed = /jpeg|jpg|png|webp|gif|avif|heic|heif/i;
+    const ext = path.extname(file.originalname || '');
+    const isExtAllowed = Boolean(ext && allowed.test(ext));
+    const mime = file.mimetype || '';
+    const isMimeAllowed = Boolean(mime && allowed.test(mime));
+    const isGenericMime = !mime || mime === 'application/octet-stream';
+
+    if ((isExtAllowed && (isMimeAllowed || isGenericMime)) || (!ext && isMimeAllowed)) {
       cb(null, true);
     } else {
-      cb(new Error('Only image files (JPEG, PNG, WebP) are allowed!'));
+      cb(new Error('Only image files (JPEG, PNG, WebP, HEIC, AVIF) are allowed!'));
     }
   }
 });
@@ -807,6 +811,25 @@ app.use((req, res) => {
     return res.sendFile(indexFile);
   }
   res.status(404).send('Page not found');
+});
+
+// Express JSON error handler (prevents HTML 500 pages on Multer/upload errors)
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  console.error('Unhandled request error:', err);
+  if (err instanceof multer.MulterError) {
+    const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    return res.status(status).json({
+      success: false,
+      message: err.code === 'LIMIT_FILE_SIZE'
+        ? 'Image file exceeds the maximum allowed size.'
+        : err.message
+    });
+  }
+  res.status(err.status || 400).json({
+    success: false,
+    message: err.message || 'Server error processing request.'
+  });
 });
 
 // Start Server when run directly (local development)
