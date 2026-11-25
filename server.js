@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -6,25 +7,82 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const cloudinary = require('cloudinary').v2;
 const { connectDB, Category, Project } = require('./models');
-require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET_KEYWORD = (process.env.SECRET_KEYWORD || 'syam_interior_2026').trim();
 
-// In-memory active session tokens: token -> { createdAt }
-const activeSessions = new Map();
+// Stateless HMAC-SHA256 session tokens (safe across Vercel serverless instances)
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const TOKEN_SECRET = crypto
+  .createHash('sha256')
+  .update(`syam-portfolio-session:${(process.env.SESSION_SECRET || SECRET_KEYWORD).trim()}`)
+  .digest();
+const revokedTokens = new Set();
+
+function createSessionToken() {
+  const payload = {
+    iat: Date.now(),
+    exp: Date.now() + TOKEN_TTL_MS,
+    jti: crypto.randomBytes(16).toString('hex')
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const signature = crypto
+    .createHmac('sha256', TOKEN_SECRET)
+    .update(payloadB64)
+    .digest('hex');
+  return `${payloadB64}.${signature}`;
+}
+
+function verifySessionToken(token) {
+  if (!token || typeof token !== 'string' || revokedTokens.has(token)) {
+    return false;
+  }
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const [payloadB64, sigHex] = parts;
+  if (!payloadB64 || !sigHex) return false;
+
+  const expectedSig = crypto
+    .createHmac('sha256', TOKEN_SECRET)
+    .update(payloadB64)
+    .digest('hex');
+
+  try {
+    const sigBuf = Buffer.from(sigHex, 'hex');
+    const expectedBuf = Buffer.from(expectedSig, 'hex');
+    if (sigBuf.length === 0 || sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+      return false;
+    }
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    return typeof payload.exp === 'number' && Date.now() < payload.exp;
+  } catch (e) {
+    return false;
+  }
+}
 
 // Configure Cloudinary
-if (process.env.CLOUDINARY_URL) {
+const cloudinaryUrl = (process.env.CLOUDINARY_URL || '').trim();
+const cloudName = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
+const apiKey = (process.env.CLOUDINARY_API_KEY || '').trim();
+const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').trim();
+
+if (cloudinaryUrl) {
+  try {
+    const parsed = new URL(cloudinaryUrl);
+    cloudinary.config({
+      cloud_name: decodeURIComponent(parsed.hostname),
+      api_key: decodeURIComponent(parsed.username),
+      api_secret: decodeURIComponent(parsed.password)
+    });
+  } catch (e) {
+    console.warn('⚠️ Invalid CLOUDINARY_URL format');
+  }
+} else if (cloudName && apiKey && apiSecret) {
   cloudinary.config({
-    cloudinary_url: process.env.CLOUDINARY_URL
-  });
-} else if (process.env.CLOUDINARY_CLOUD_NAME) {
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
+    cloud_name: cloudName,
+    api_key: apiKey,
+    api_secret: apiSecret
   });
 }
 
@@ -32,8 +90,8 @@ if (process.env.CLOUDINARY_URL) {
 function uploadToCloudinary(buffer, filename = 'image') {
   return new Promise((resolve, reject) => {
     const isCloudinaryConfigured = Boolean(
-      process.env.CLOUDINARY_URL ||
-      (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)
+      cloudinaryUrl ||
+      (cloudName && apiKey && apiSecret)
     );
 
     if (!isCloudinaryConfigured) {
@@ -219,7 +277,7 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ success: false, message: 'Authentication required. Please sign in.' });
   }
   const token = authHeader.split(' ')[1];
-  if (!activeSessions.has(token)) {
+  if (!verifySessionToken(token)) {
     return res.status(401).json({ success: false, message: 'Session expired or invalid. Please sign in again.' });
   }
   next();
@@ -249,8 +307,7 @@ app.post(['/api/auth/login', '/auth/login'], (req, res) => {
   }
 
   if (isValid) {
-    const token = crypto.randomBytes(32).toString('hex');
-    activeSessions.set(token, { createdAt: Date.now() });
+    const token = createSessionToken();
     return res.json({ success: true, token, message: 'Authentication successful.' });
   } else {
     return res.status(401).json({ success: false, message: 'Invalid secret keyword. Please verify and try again.' });
@@ -262,7 +319,7 @@ app.get(['/api/auth/verify', '/auth/verify'], (req, res) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
-    if (activeSessions.has(token)) {
+    if (verifySessionToken(token)) {
       return res.json({ authenticated: true });
     }
   }
@@ -274,7 +331,7 @@ app.post(['/api/auth/logout', '/auth/logout'], (req, res) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
-    activeSessions.delete(token);
+    revokedTokens.add(token);
   }
   res.json({ success: true, message: 'Logged out successfully.' });
 });

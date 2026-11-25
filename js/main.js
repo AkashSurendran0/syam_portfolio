@@ -252,8 +252,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (data.projects.length === 0) {
         grid.innerHTML = `
           <div style="grid-column: 1 / -1; padding: 60px 20px; text-align: center; color: var(--color-text-muted);">
-            <p style="font-size: 1.1rem; margin-bottom: 8px;">No projects published yet.</p>
-            <p style="font-size: 0.85rem; opacity: 0.7;">Create projects in the <a href="/adminPortal" style="color: inherit; text-decoration: underline;">Admin Portal</a>.</p>
+            <p style="font-size: 1.1rem; margin-bottom: 0;">No projects published yet.</p>
           </div>
         `;
         return;
